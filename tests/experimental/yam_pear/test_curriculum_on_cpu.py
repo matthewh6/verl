@@ -57,8 +57,10 @@ class _Reference:
             r = min(ok, key=lambda r: abs(p[r] - 0.5))
             cand = [r] + ([min(x for x in ok if x > r)] if p[r] > a.hi and r < max(ok) else [])
         mid, hard, easy = min(cand, key=lambda r: abs(p[r] - 0.6)), max(cand), min(cand)
-        n_probe = 2 if n_groups >= 5 and hard != mid else 1
-        rungs = [hard] * n_probe + [easy if i % 3 == 2 else mid for i in range(n_probe, n_groups)]
+        above = [r for r in ok if r > hard]
+        probe = above[0] if above and p[hard] >= 0.5 else hard
+        n_probe = 2 if n_groups >= 5 and probe != mid and p[probe] >= 0.15 else 1
+        rungs = [probe] * n_probe + [easy if i % 3 == 2 else mid for i in range(n_probe, n_groups)]
         return rungs, [round(x, 2) for x in p]
 
     def observe(self, est, tab):
@@ -69,7 +71,7 @@ class _Reference:
             est[str(r)] = (
                 [round(0.75 * s + c[0], 3), round(0.75 * n + c[1], 3)]
                 if c
-                else [round(0.95 * s, 3), round(0.95 * n, 3)]
+                else [round(0.85 * s, 3), round(0.85 * n, 3)]
             )
 
 
@@ -128,26 +130,56 @@ def test_estimate_rules():
 def test_plan_allocation_and_holdout():
     counts = {"s": {"0": [8, 8], "1": [6, 8], "2": [4, 8], "3": [3, 8], "4": [0, 8]}}
     c = LadderCurriculum(counts=counts)
-    # estimates 0.94, 0.72, 0.5, 0.39, 0.06: candidates in [0.3, 0.8] are rungs 1, 2, 3; nearest 0.6 is rung 2
+    # estimates 0.94, 0.72, 0.5, 0.39, 0.06: candidates in [0.3, 0.8] are rungs 1, 2, 3; nearest 0.6 is rung 2;
+    # the hardest candidate (0.39) does not work half the time yet, so it is the probe itself
     assert c.plan("s", 6)[0] == [3, 3, 1, 2, 2, 1]  # two probes on the hardest, every third on the easiest
     assert c.plan("s", 4)[0] == [3, 2, 1, 2]  # fewer than five groups: one probe
     held = LadderCurriculum(holdout_rungs=[3], counts=counts)
-    assert held.plan("s", 6)[0] == [2, 2, 1, 2, 2, 1]  # hardest == nearest 0.6: one probe
+    # hardest candidate is rung 2 at 0.5: the probe moves past it, skipping the held-out rung 3, to rung 4;
+    # rung 4 is estimated below 0.15, so it only gets one group
+    assert held.plan("s", 6)[0] == [4, 2, 1, 2, 2, 1]
     with pytest.raises(ValueError):
         LadderCurriculum(holdout_rungs=range(len(RUNGS)))
 
 
+def test_probe_goes_one_rung_past_a_working_frontier_despite_a_stale_estimate():
+    base = {"0": [8, 8], "1": [8, 8], "2": [6, 8], "3": [5, 8]}  # 0.94, 0.94, 0.72, 0.61
+    stale = LadderCurriculum(counts={"s": {**base, "4": [2, 8]}})  # rung 4 measured long ago at 0.28: not a candidate
+    assert stale.estimate("s")[3] >= 0.5 and stale.estimate("s")[4] < 0.3
+    assert stale.plan("s", 6)[0] == [4, 4, 2, 3, 3, 2]  # probed anyway, with two groups (0.28 >= 0.15)
+    hopeless = LadderCurriculum(counts={"s": {**base, "4": [0, 8]}})  # 0.06 < 0.15: a single probe group
+    assert hopeless.plan("s", 6)[0] == [4, 3, 2, 3, 3, 2]
+    not_yet = LadderCurriculum(counts={"s": {**base, "3": [3, 8], "4": [2, 8]}})  # frontier at 0.39 < 0.5
+    assert not_yet.plan("s", 6)[0] == [3, 3, 2, 2, 2, 2]
+    top = LadderCurriculum(num_rungs=4, counts={"s": base})  # nothing above the hardest candidate
+    assert top.plan("s", 6)[0] == [3, 3, 2, 3, 3, 2]  # the probe is the rung nearest 0.6 itself: one group
+
+
 def test_plan_outside_the_band():
     counts = {str(r): [8, 8] for r in range(10)}
-    # nothing in the band; rung 10 (0.83) is the rung nearest one half and is above the band: it and the next
+    # nothing in the band; rung 10 (0.83) is the rung nearest one half and is above the band: it and the next.
+    # The probe is rung 11, estimated at 0.06 (< 0.15): one group
     solved = LadderCurriculum(counts={"s": {**counts, "10": [7, 8], "11": [0, 8]}})
-    assert solved.plan("s", 5)[0] == [11, 11, 10, 10, 10]
+    assert solved.plan("s", 5)[0] == [11, 10, 10, 10, 10]
     # the rung nearest one half is below the band: all groups go to it
     stuck = LadderCurriculum(counts={"s": {**counts, "10": [8, 8], "11": [1, 8]}})
     assert stuck.plan("s", 5)[0] == [11] * 5
-    # Reference quirk, kept: an exact tie in distance from one half goes to the lowest rung.
+    # Reference quirk, kept: an exact tie in distance from one half goes to the lowest rung (0, with 1);
+    # the probe then goes one past rung 1
     tie = LadderCurriculum(counts={"s": {**counts, "10": [8, 8], "11": [0, 8]}})
-    assert tie.plan("s", 5)[0] == [1, 1, 0, 0, 0]
+    assert tie.plan("s", 5)[0] == [2, 2, 0, 0, 0]
+
+
+def test_unobserved_rungs_fade_by_0_85_and_become_unmeasured():
+    c = LadderCurriculum(counts={"s": {"0": [6, 8], "1": [2, 8]}})
+    c.observe("s", {"0": [5, 8]})
+    assert c.counts["s"]["0"] == [9.5, 14.0] and c.counts["s"]["1"] == [1.7, 6.8]  # 0.75 x old + new; 0.85 x old
+    steps = 1
+    while c.counts["s"]["1"][1] >= 4:
+        c.observe("s", {})
+        steps += 1
+    assert steps == 5  # 8 episodes drop below the 4 that count as measured after five unrefreshed steps
+    assert c.estimate("s")[1] == pytest.approx(0.7 * c.estimate("s")[0])  # treated as untried again
 
 
 def test_state_roundtrip_and_success_table():
