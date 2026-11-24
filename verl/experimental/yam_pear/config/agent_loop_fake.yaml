@@ -1,0 +1,12 @@
+# Agent loop config for smoke runs: the recipe's fake simulator (pure Python, no dependencies),
+# started with whatever `python3` is on PATH.
+- name: yam_pear_agent
+  _target_: verl.experimental.yam_pear.agent_loop.YamPearAgentLoop
+  history_k: 4
+  max_tokens: 1024
+  max_concurrent_sims: 8
+  sims:
+    fake:
+      command: [python3, "{bridge}", --backend, fake]
+      environment_file: fake_environment.md
+      timeout: 60

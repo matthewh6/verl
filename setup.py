@@ -97,6 +97,7 @@ setup(
             "trainer/config/*.yaml",
             "trainer/config/*/*.yaml",
             "experimental/*/config/*.yaml",
+            "experimental/*/prompts/*.md",
         ],
     },
     include_package_data=True,

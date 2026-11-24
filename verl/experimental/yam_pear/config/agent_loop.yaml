@@ -1,0 +1,54 @@
+# Agent loop config for rollout.agent.agent_loop_config_path: the two real simulators.
+#
+# Each simulator lives in its own Python environment (not the verl one), so the agent loop talks to it
+# through `sim_bridge.py`, started with that environment's interpreter. `{bridge}` is replaced by the path
+# of the recipe's sim_bridge.py. Required environment variables (on every node that runs agent loop workers):
+#   PEAR_ROOT     the PEAR work tree: holds raiden/venv, raiden/src, raiden/assets_local and tools/cur3
+#   ABC_SIM_DIR   the ABC simulator checkout (the directory with .venv; the driver must start inside it)
+# Optional: EGL_GPU (GPU index MuJoCo renders on, default 0).
+- name: yam_pear_agent
+  _target_: verl.experimental.yam_pear.agent_loop.YamPearAgentLoop
+  history_k: 4
+  max_tokens: 6144
+  max_concurrent_sims: 4   # per agent loop worker; x rollout.agent.num_workers simulators at once
+  sims:
+    raiden:
+      command:
+        - ${oc.env:PEAR_ROOT}/raiden/venv/bin/python
+        - "{bridge}"
+        - --backend
+        - driver
+        - --driver-dir
+        - ${oc.env:PEAR_ROOT}/tools/cur3/raiden
+        - --driver-module
+        - raiden_pear
+      cwd: ${oc.env:PEAR_ROOT}/tools/cur3/raiden
+      env:
+        MUJOCO_GL: egl
+        MUJOCO_EGL_DEVICE_ID: ${oc.env:EGL_GPU,0}
+        __EGL_VENDOR_LIBRARY_DIRS: null   # removed from the environment, as rollouts_adapt.sh does
+        RAIDEN_SIM_ASSETS: ${oc.env:PEAR_ROOT}/raiden/assets_local
+        PYTHONPATH: ${oc.env:PEAR_ROOT}/raiden/src
+      environment_file: raiden_environment.md
+      episode_args: {}
+      timeout: 900
+    abc:
+      command:
+        - ${oc.env:ABC_SIM_DIR}/.venv/bin/python
+        - "{bridge}"
+        - --backend
+        - driver
+        - --driver-dir
+        - ${oc.env:PEAR_ROOT}/tools/cur3/abc
+        - --driver-module
+        - abc_pear_cur
+      cwd: ${oc.env:ABC_SIM_DIR}
+      env:
+        MUJOCO_GL: egl
+        MUJOCO_EGL_DEVICE_ID: ${oc.env:EGL_GPU,0}
+        __EGL_VENDOR_LIBRARY_DIRS: null
+      environment_file: abc_environment.md
+      episode_args:
+        lift: 0.08
+        lift_pick: 0
+      timeout: 900
