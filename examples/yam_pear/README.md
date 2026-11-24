@@ -103,6 +103,33 @@ What verl offers, from its code and docs (none of it run here):
   both. `separate_async` (a rollout GPU and a trainer GPU that never switch) is the other 2-GPU layout verl
   has, but rollouts then run ahead of training, which the curriculum dataloader does not support.
 
+## One update per step
+
+A step's training samples are (groups x 8 x turns) rows, between 128 and 3200 depending on how long the
+episodes ran. verl takes one optimizer step per *mini-batch*: `train_batch` zeroes the gradient, runs
+forward/backward over the mini-batch's micro-batches, accumulating the gradient, and steps the optimizer
+once. So "one update per step" means "one mini-batch per step". The trainer only offers a fixed mini-batch
+size, `ppo_mini_batch_size x rollout.n` rows, and pads every batch to a multiple of it; there is no
+"whole batch" setting in the config (the worker's `num_mini_batch` argument is not reachable from it).
+
+The config therefore sets `ppo_mini_batch_size: 400` = 16 groups x 25, the longest turn cap in the ladder,
+so that 3200 rows is the most a step can have and every step is padded to exactly one mini-batch.
+`use_dynamic_bsz: true` is needed for verl to accept a mini-batch larger than `train_batch_size`;
+micro-batches are then packed up to `ppo_max_token_len_per_gpu` tokens (it must cover the longest sample).
+If you change `streams` or the ladder, keep `ppo_mini_batch_size = data.train_batch_size x longest turn
+cap`; `test_one_update_per_step_on_cpu.py` fails otherwise.
+
+What the padding does. Padding rows are synthetic 128-token sequences with an all-zero loss mask and zero
+reward, under a uid of their own (so they are in no GRPO group). With `loss_agg_mode: token-mean` the loss is
+`sum(masked token losses) / (loss-mask tokens in the mini-batch)`: padding rows add nothing to the sum and
+nothing to the count, so the loss and its gradient are the same as for a true single batch of the real rows
+(checked on CPU for verl's `agg_loss`). This would not hold for the `seq-mean-*` modes, which divide by the
+number of rows. The cost is compute: with short episodes most of the 3200 rows are padding, each a
+128-token forward/backward (about 10-15% extra tokens at 6 turns per episode). Not verified on a GPU: that
+padding rows (which carry no images) batch correctly with multimodal rows in one micro-batch, and the
+memory of token-packed micro-batches for this model (`ppo_max_token_len_per_gpu` may need lowering, but not
+below `prompt_length + response_length`).
+
 ## Run
 
 ```bash
@@ -190,9 +217,8 @@ Not verified (needs the GPU node):
   standard deviation, `1e-4`, and zeroed groups whose std was below `1e-3`.
 * **Turns trained on.** Every turn of every episode is a sample. The old trainer had a
   `--turns-per-episode 4` option.
-* **Updates per step.** A step's samples are (groups x 8 x turns) rows, split into mini-batches of
-  `ppo_mini_batch_size x rollout.n` rows, so a step makes several optimizer updates where the old loop
-  made one.
+* **Updates per step.** One optimizer update per training step, as before; see
+  [One update per step](#one-update-per-step) for how.
 * **Failed rollouts.** A server or simulator failure raises; verl marks the rollout as failed. The old loop
   redid such episodes up to four times (`trainer.v1.sampler.sync_refill_failed_groups` is verl's refill).
 * **Calibration and evaluation** run as verl validation (`val_before_train`, `test_freq`), on the seeds and

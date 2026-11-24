@@ -59,9 +59,19 @@ actor_rollout_ref:
     target_modules: '.*language_model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)'
   actor:
     strategy: fsdp
-    ppo_mini_batch_size: 16
-    ppo_micro_batch_size_per_gpu: 1
+    # ONE optimizer update per training step. A step's samples are (groups x rollout.n x turns) rows, and verl
+    # takes one optimizer step per mini-batch of (ppo_mini_batch_size x rollout.n) rows, accumulating the
+    # gradient over the micro-batches inside it. So the mini-batch is sized to the most rows a step can have:
+    # 16 groups x 25 (the longest turn cap in RUNGS) = 400. The batch is padded up to that with masked rows
+    # that add nothing to the loss or its token count (README, "One update per step"). Keep this at
+    # data.train_batch_size x the longest turn cap; tests/experimental/yam_pear checks it.
+    ppo_mini_batch_size: 400
     ppo_epochs: 1
+    # needed for a mini-batch larger than train_batch_size (the fixed-size path rejects it); micro-batches
+    # are then packed by tokens. The budget must cover the longest sample (prompt_length + response_length).
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 24576
+    ppo_micro_batch_size_per_gpu: 1   # unused with use_dynamic_bsz
     use_kl_loss: false
     entropy_coeff: 0
     loss_agg_mode: token-mean
@@ -91,6 +101,7 @@ actor_rollout_ref:
     top_k: -1
     calculate_log_probs: true
     log_prob_micro_batch_size_per_gpu: 1
+    # log_prob_use_dynamic_bsz / log_prob_max_token_len_per_gpu follow the actor settings by default
     topk_log_probs: 32     # the sampler's top-32 head for score centering
     # per TURN, not per episode: every turn is its own sample (system + 4 turns of text + 3 frames)
     prompt_length: 16384
