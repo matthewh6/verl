@@ -5,6 +5,9 @@
 #   PEAR_ROOT=/data/users/<you>/pear ABC_SIM_DIR=/path/to/abc-sim/abc \
 #   MODEL_PATH=$PEAR_ROOT/work/models/Qwen3.8-27B-PEAR bash examples/yam_pear/run_qwen3_8_27b_pear_fsdp.sh
 #
+# Episode records and sampled frames (off unless set): YAM_PEAR_ARTIFACTS_DIR=<run>/episodes,
+# YAM_PEAR_ARTIFACT_FRAMES=none|sample|all, YAM_PEAR_ARTIFACT_VAL_FRAMES=true|false. See the README.
+#
 # Extra arguments are passed to hydra, e.g. data.custom_dataloader.holdout_rungs=7 trainer.total_training_steps=50
 set -xeuo pipefail
 

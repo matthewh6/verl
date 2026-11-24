@@ -11,6 +11,12 @@
   history_k: 4
   max_tokens: 6144
   max_concurrent_sims: 4   # per agent loop worker; x rollout.agent.num_workers simulators at once
+  # Per-episode records (episode.json + turns.json in the old drivers' layout) and sampled camera frames.
+  # Disabled unless a directory is given; it must be on a filesystem all agent loop workers share.
+  artifacts:
+    dir: ${oc.env:YAM_PEAR_ARTIFACTS_DIR,null}            # e.g. <run>/episodes
+    frames: ${oc.env:YAM_PEAR_ARTIFACT_FRAMES,sample}     # training frames: none | sample (one group per stream per step) | all
+    val_frames: ${oc.env:YAM_PEAR_ARTIFACT_VAL_FRAMES,false}   # frames of all validation/calibration episodes
   sims:
     raiden:
       command:

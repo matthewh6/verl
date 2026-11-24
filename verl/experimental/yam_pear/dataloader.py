@@ -60,7 +60,18 @@ def parse_rungs(rungs: str | int | Iterable[int] | None) -> list[int]:
 
 
 def make_row(
-    sim: str, task: str, seed: int, rung: int, *, split: str, index: int, plan_id: int = -1, calibration: bool = False
+    sim: str,
+    task: str,
+    seed: int,
+    rung: int,
+    *,
+    split: str,
+    index: int,
+    plan_id: int = -1,
+    calibration: bool = False,
+    group: int = -1,
+    group_index: int = -1,
+    groups_in_stream: int = 0,
 ) -> dict[str, Any]:
     """One dataset row: an episode start.
 
@@ -73,6 +84,9 @@ def make_row(
         index: The row's ``extra_info.index``.
         plan_id: The curriculum step that planned the row (-1: not planned by the curriculum).
         calibration: Whether the row is a calibration episode (seeds the estimates, not an evaluation).
+        group: A number that tells apart rows sharing a seed (validation: 100 x stream + rung); -1: unused.
+        group_index: Position of the group among its stream's groups in a planned step (-1: not planned).
+        groups_in_stream: How many groups the stream has in that step (0: not planned).
 
     Returns:
         The row, in the layout of verl's RL parquet files (``prompt``, ``data_source``, ``extra_info``).
@@ -95,6 +109,9 @@ def make_row(
             "split": split,
             "plan_id": int(plan_id),
             "calibration": bool(calibration),
+            "group": int(group),
+            "group_index": int(group_index),
+            "groups_in_stream": int(groups_in_stream),
         },
     }
 
@@ -104,10 +121,21 @@ def probe_rows(
 ) -> list[dict[str, Any]]:
     """Held-out episodes: ``n_seeds`` seeds x one row per stream and rung (the orchestrator's ``probe``)."""
     rows = []
-    for sim, task, _ in streams:
+    for si, (sim, task, _) in enumerate(streams):
         for rung in rungs:
             for i in range(n_seeds):
-                rows.append(make_row(sim, task, seed0 + i, rung, split="val", index=len(rows), calibration=calibration))
+                rows.append(
+                    make_row(
+                        sim,
+                        task,
+                        seed0 + i,
+                        rung,
+                        split="val",
+                        index=len(rows),
+                        calibration=calibration,
+                        group=si * 100 + rung,  # one scene seed per i, shared by all rungs and streams
+                    )
+                )
     return rows
 
 
@@ -292,7 +320,19 @@ class CurriculumDataLoader:
             for i, rung in enumerate(rungs):
                 seed = self.seed0 + k * 10000 + si * 100 + i
                 index = k * 10000 + si * 100 + i
-                self.queue.append(make_row(sim, task, seed, rung, split="train", index=index, plan_id=k))
+                self.queue.append(
+                    make_row(
+                        sim,
+                        task,
+                        seed,
+                        rung,
+                        split="train",
+                        index=index,
+                        plan_id=k,
+                        group_index=i,
+                        groups_in_stream=len(rungs),
+                    )
+                )
         self.plan_id += 1
         record = {
             "plan_id": k,

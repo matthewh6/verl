@@ -27,6 +27,7 @@ import verl.trainer.ppo.v1.agent_loop_tq as agent_loop_tq_module
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker, _agent_loop_registry
 from verl.experimental.yam_pear import protocol
 from verl.experimental.yam_pear.agent_loop import YamPearAgentLoop
+from verl.experimental.yam_pear.artifacts import EpisodeArtifacts
 from verl.experimental.yam_pear.dataloader import AGENT_NAME, OutcomeLog, make_row
 from verl.protocol import DataProto
 from verl.trainer.ppo.core_algos import AdvantageEstimator
@@ -148,13 +149,16 @@ class MockServer:
         )
 
 
-def make_loop(tmp_path, server, history_k=2, max_tokens=4096):
+def make_loop(tmp_path, server, history_k=2, max_tokens=4096, artifacts=None):
     loop = YamPearAgentLoop.__new__(YamPearAgentLoop)
     tokenizer = server.tokenizer
     loop.tokenizer = tokenizer
     loop.processor = object()  # multimodal on: frames are extracted from the messages
     loop.dataset_cls = RLHFDataset
     loop.data_config = OmegaConf.create({})
+    loop.config = OmegaConf.create({"actor_rollout_ref": {"model": {"path": "/models/Qwen3.8-27B-PEAR/"}}})
+    loop.apply_chat_template_kwargs = {"reasoning_effort": "low"}
+    loop.artifacts = EpisodeArtifacts(**(artifacts or {}))
     loop.mm_processor_kwargs = {}
     loop.rollout_config = OmegaConf.create({"prompt_length": 100000, "response_length": 2048})
     loop.continuous_token_builder = FakeBuilder(tokenizer)

@@ -20,6 +20,7 @@ there on a branch of the verl fork. The recipe lives in the fork itself:
 | `verl/experimental/yam_pear/protocol.py` | The station conversation: system prompt, short-context prompt, action parsing. |
 | `verl/experimental/yam_pear/agent_loop.py` | `YamPearAgentLoop`, registered as `yam_pear_agent`. |
 | `verl/experimental/yam_pear/curriculum.py` | `LadderCurriculum`: the `estimate` / `plan` / `observe` controller and `RUNGS`. |
+| `verl/experimental/yam_pear/artifacts.py` | `EpisodeArtifacts`: per-episode `episode.json` / `turns.json` and sampled camera frames. |
 | `verl/experimental/yam_pear/dataloader.py` | Episode rows, the outcome log, `CurriculumDataLoader` (`data.custom_dataloader`). |
 | `verl/experimental/yam_pear/prompts/` | `station_system_prompt.md`, `raiden_environment.md`, `abc_environment.md` (copied unchanged), `fake_environment.md`. |
 | `verl/experimental/yam_pear/config/` | Agent loop configs: `agent_loop.yaml` (raiden + ABC), `agent_loop_fake.yaml`. |
@@ -163,6 +164,59 @@ echo '{"cmd": "reset", "sim": "raiden", "task": "pick_cube", "seed": 3, "prepose
     --backend driver --driver-dir $PEAR_ROOT/tools/cur3/raiden --driver-module raiden_pear | head -c 600
 ```
 
+## Episode artifacts
+
+Off by default. Set `artifacts.dir` in the agent loop config (`agent_loop.yaml` reads it from the
+environment) to get the old pipeline's per-episode files back:
+
+```bash
+YAM_PEAR_ARTIFACTS_DIR=/path/to/run/episodes \      # unset = disabled
+YAM_PEAR_ARTIFACT_FRAMES=sample \                   # training frames: none | sample | all (default sample)
+YAM_PEAR_ARTIFACT_VAL_FRAMES=false \                # frames of all validation/calibration episodes
+bash examples/yam_pear/run_qwen3_8_27b_pear_fsdp.sh
+```
+
+```text
+<dir>/step_<NNN>/s<seed>_g<i>/        training; NNN = the trainer's global step (1-based), i = rollout in the group
+<dir>/eval_<NNN>/s<seed>_g<group>/    validation; group = 100 x stream + rung, as the old probe named them
+<dir>/calibration/s<seed>_g<group>/   calibration episodes (first validation pass)
+    episode.json  turns.json  system_prompt.md  [turnNN_<camera>.jpg ...  final_<camera>.jpg]
+```
+
+* **Records, for every episode.** `episode.json` and `turns.json` use the field names of `raiden_pear.py` /
+  `abc_pear_cur.py` `main()`, without token ids and log-probs. `episode.json`: `task`, `seed`, `start`,
+  `randomization_request`, `instruction`, `prepose` (the simulator's report, with `radius` / `height` /
+  `stage`), `lift` / `lift_pick` for ABC, `end_reason`, `success`, `max_reward`, `num_turns`, `effort`,
+  `history_k`, `max_tokens`, `wall_s`, `completion_tokens`; and, new, `sim`, `rung`, `split`,
+  `global_steps`, `plan_id` (the curriculum's 0-based step), `uid` (the group), `session_id`, `frames`.
+  `turns.json`, per turn: `turn`, `state`, `user_text`, `reasoning`, `answer`, `finish_reason`, `usage`,
+  `action`, `feedback`, `result`, `success`, `max_reward` (the reward so far), `model_seconds`,
+  `sim_seconds`, `images`, and `parse_error` on the turn that ended a `parse` / `budget` episode. Not
+  written: `randomization`, `sim_steps*`, `lift_body`, the dense action recordings. A rollout that fails
+  (server or simulator error) writes nothing.
+* **Frames, for a sample.** With `frames: sample`, the three JPEGs of every turn (the bytes the simulator
+  sent, before verl's resize) are kept for one group per stream per training step: all 8 rollouts of the
+  group whose position in its stream equals a hash of (curriculum step, stream), so every worker picks the
+  same group without coordination and the choice moves around between steps. This needs rows planned by the
+  curriculum dataloader; with the static `train.parquet`, `sample` keeps no frames. `val_frames: true` keeps
+  the frames of all validation and calibration episodes.
+* **Writing.** Each episode directory is written under a temporary name and renamed into place, so readers
+  never see half an episode and any number of agent loop workers can write to one directory, which must be
+  on a filesystem they share. A prompt that is run again (after a resume) replaces its directory.
+
+**Report tools and videos.** The behaviour-report tools read these files as they are:
+`behavior_report/extract_inc.py` globs `<run>/episodes/step_*/*/{episode.json,turns.json}` and keeps each
+turn's `action` and `result`, so point `artifacts.dir` at `<run>/episodes`; `pipeline.py` uses
+`task`, `prepose`, `success`, `max_reward` and `num_turns`. Videos need nothing saved by verl beyond the
+records: `replay_video.py` rebuilds the scene from `episode.json` (`task`, `seed`, `start`, `prepose`,
+`lift`, `lift_pick`), replays the recorded `action` of every turn in the simulator and renders it, then
+prints the replayed success and reward next to the recorded ones. Two things to adapt in those tools:
+step directories are numbered by verl's global step, which starts at 1 (the old loop's `step_000` is
+`step_001` here; `plan_id` in `episode.json` is the old number), and only episodes of the sampled groups
+have saved frames to show next to a replay. The tools themselves were not run against these records (their
+paths are hard-wired to the node); the tests check the field names, and that replaying the recorded actions
+from `episode.json` reproduces the recorded outcome in the fake simulator.
+
 ## Tests
 
 ```bash
@@ -175,7 +229,9 @@ against a stub driver); action parsing and end reasons; short-context prompt bui
 controller against a verbatim copy of the reference `estimate` / `plan` / `observe` over simulated training;
 the dataloader through verl's `create_custom_dataloader`; the agent loop end to end with a mocked LLM server
 and the fake simulator, including verl's own per-output storage (`_agent_loop_postprocess`) and
-`compute_advantage_for_multi_trajectories` on what the loop returns.
+`compute_advantage_for_multi_trajectories` on what the loop returns. Also: one optimizer update per step from
+the shipped config; episode records complete and re-simulable, frame sampling of exactly one group per stream
+per step, artifacts off by default.
 
 `test_recorded_episode_on_cpu.py` is skipped unless `YAM_PEAR_MODEL_DIR` (the PEAR tokenizer/processor
 files; no weights are loaded) and `YAM_PEAR_EPISODE_DIR` (an episode recorded by `raiden_pear.py --token-ids`)
@@ -224,6 +280,8 @@ Not verified (needs the GPU node):
 * **Calibration and evaluation** run as verl validation (`val_before_train`, `test_freq`), on the seeds and
   rungs of the old `probe`; calibration episodes appear under `calibration/...` in the validation metrics
   of the first pass.
-* **Not ported:** the vLLM/tmux process management and GPU sharing with another tenant, per-episode
-  artifact directories (`turns.json`, saved frames, `episode.json`), `--object-state`, `--record-dense`,
-  full-history mode (`--history-k -1`), `ABC_EXTRA`, and `expert_check.py` / `stage_check.py`.
+* **Episode artifacts** are opt-in ([Episode artifacts](#episode-artifacts)): records for every episode,
+  frames for a sample. The old loop saved every frame of every episode.
+* **Not ported:** the vLLM/tmux process management and GPU sharing with another tenant, `--object-state`,
+  `--record-dense`, full-history mode (`--history-k -1`), `ABC_EXTRA`, and `expert_check.py` /
+  `stage_check.py`.

@@ -38,6 +38,7 @@ from PIL import Image
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
 from verl.experimental.yam_pear import protocol
+from verl.experimental.yam_pear.artifacts import EpisodeArtifacts
 from verl.experimental.yam_pear.dataloader import AGENT_NAME, OutcomeLog
 from verl.experimental.yam_pear.sim_client import SimBridgeClient
 from verl.workers.rollout.replica import TokenOutput
@@ -75,6 +76,8 @@ class YamPearAgentLoop(AgentLoopBase):
         outcome_dir: Directory of the episode outcome log read by the curriculum dataloader. Defaults to
             ``data.custom_dataloader.outcome_dir``; no log is written when neither is set.
         max_concurrent_sims: Simulator processes alive at once per agent loop worker.
+        artifacts: ``{dir, frames, val_frames}`` for :class:`EpisodeArtifacts`: per-episode ``episode.json`` /
+            ``turns.json`` in the drivers' layout, and camera frames for a sample. Disabled unless ``dir`` is set.
     """
 
     merges_context_messages = False  # every turn is built with build_initial_tokens; nothing is merged
@@ -87,6 +90,7 @@ class YamPearAgentLoop(AgentLoopBase):
         max_tokens: int = 6144,
         outcome_dir: Optional[str] = None,
         max_concurrent_sims: int = 4,
+        artifacts: Optional[dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -98,6 +102,7 @@ class YamPearAgentLoop(AgentLoopBase):
         if outcome_dir is None:
             outcome_dir = (self.data_config.get("custom_dataloader") or {}).get("outcome_dir")
         self.outcomes = OutcomeLog(os.path.expanduser(str(outcome_dir))) if outcome_dir else None
+        self.artifacts = EpisodeArtifacts(**(_plain(artifacts) or {}))
         self._think_end_id = self._resolve_think_end_id()
 
     def _resolve_think_end_id(self) -> Optional[int]:
@@ -106,13 +111,19 @@ class YamPearAgentLoop(AgentLoopBase):
             return None
         return token_id
 
+    def _split_completion(self, token_ids: list[int]) -> tuple[str, str]:
+        """(reasoning, answer) of a completion, split at its last ``</think>``."""
+        ids, reasoning_ids = list(token_ids), []
+        if self._think_end_id is not None and self._think_end_id in ids:
+            cut = len(ids) - ids[::-1].index(self._think_end_id)
+            reasoning_ids, ids = ids[: cut - 1], ids[cut:]
+        reasoning = self.tokenizer.decode(reasoning_ids, skip_special_tokens=True) if reasoning_ids else ""
+        text_reasoning, answer = protocol.split_reasoning(self.tokenizer.decode(ids, skip_special_tokens=True))
+        return reasoning + text_reasoning, answer
+
     def _answer_text(self, token_ids: list[int]) -> str:
         """The completion after its reasoning: what the station parses and what the history keeps."""
-        ids = list(token_ids)
-        if self._think_end_id is not None and self._think_end_id in ids:
-            ids = ids[len(ids) - ids[::-1].index(self._think_end_id) :]
-        text = self.tokenizer.decode(ids, skip_special_tokens=True)
-        return protocol.split_reasoning(text)[1]
+        return self._split_completion(token_ids)[1]
 
     def _environment_text(self, sim_config: dict[str, Any]) -> str:
         path = Path(os.path.expanduser(str(sim_config["environment_file"])))
@@ -209,6 +220,10 @@ class YamPearAgentLoop(AgentLoopBase):
         feedback: Optional[str] = None
         end_reason: Optional[str] = None
         completion_tokens = 0
+        records: list[dict[str, Any]] = []  # turns.json, in the drivers' field names
+        keep_frames = self.artifacts.wants_frames(info)
+        frames: dict[str, bytes] = {}
+        episode_start = time.monotonic()
         async with _slots(self.max_concurrent_sims):
             client = SimBridgeClient(
                 list(sim_config["command"]),
@@ -218,32 +233,58 @@ class YamPearAgentLoop(AgentLoopBase):
             )
             try:
                 reply = await client.reset(sim, task, seed, prepose, sim_config.get("episode_args"))
-                system = protocol.build_system_prompt(self._environment_text(sim_config), reply["instruction"])
-                for _ in range(max_turns):
+                instruction, prepose_report = reply["instruction"], reply.get("prepose")
+                system = protocol.build_system_prompt(self._environment_text(sim_config), instruction)
+                for turn_index in range(max_turns):
                     text = protocol.build_user_text(reply["observation"]["state"], feedback)
                     images = self._decode_images(reply["observation"]["images"])
+                    record: dict[str, Any] = {"turn": turn_index, "state": reply["observation"]["state"]}
+                    record.update(user_text=text, images=[])
+                    records.append(record)
+                    if keep_frames:  # exactly the bytes the simulator sent
+                        for camera, data in reply["observation"]["images"].items():
+                            record["images"].append(f"turn{turn_index:02d}_{camera}.jpg")
+                            frames[record["images"][-1]] = base64.b64decode(data)
                     messages = protocol.build_messages(
                         system, past, self.history_k, protocol.build_user_content(text, images)
                     )
                     generated = await self._generate_turn(messages, sampling_params, request_id, priority)
                     if generated is None:
+                        record["error"] = "the prompt does not fit the context (rollout.prompt_length)"
                         end_reason = "budget"
                         break
                     turn, token_output = generated
                     outputs.append(turn)
                     completion_tokens += len(token_output.token_ids)
+                    reasoning, answer = self._split_completion(token_output.token_ids)
+                    record.update(
+                        model_seconds=round(turn.metrics.generate_sequences, 2),
+                        reasoning=reasoning,
+                        answer=answer,
+                        finish_reason="length" if token_output.stop_reason == "length" else "stop",
+                        usage={"prompt_tokens": len(turn.prompt_ids), "completion_tokens": len(token_output.token_ids)},
+                    )
                     if token_output.stop_reason == "length":  # cut at the token limit
+                        record["parse_error"] = "the server cut the answer at its token limit"
                         end_reason = "budget"
                         break
-                    answer = self._answer_text(token_output.token_ids)
                     try:
                         action = protocol.parse_action(answer)
-                    except protocol.ActionParseError:
+                    except protocol.ActionParseError as exc:
+                        record["parse_error"] = str(exc)
                         end_reason = "parse"
                         break
                     start = time.monotonic()
                     reply = await client.step(action)
                     turn.metrics.tool_calls = time.monotonic() - start
+                    record.update(
+                        action=action,
+                        feedback=reply["feedback"],
+                        result=reply["result"],
+                        sim_seconds=round(turn.metrics.tool_calls, 2),
+                        success=bool(reply["success"]),
+                        max_reward=float(reply["reward"]),
+                    )
                     feedback = reply["feedback"]
                     past.append((text, answer.strip()))
                     if reply["success"]:
@@ -251,10 +292,50 @@ class YamPearAgentLoop(AgentLoopBase):
                         break
                 else:
                     end_reason = "max_turns"
+                if keep_frames:
+                    for camera, data in reply["observation"]["images"].items():
+                        frames[f"final_{camera}.jpg"] = base64.b64decode(data)
             finally:
                 await client.close()
 
         reward, success = float(reply["reward"]), bool(reply["success"])
+        if self.artifacts.enabled:
+            global_steps, session_id = int(kwargs.get("global_steps", 0)), int(kwargs.get("session_id", 0))
+            step_dir, name = self.artifacts.location(info, global_steps, session_id)
+            episode = {
+                "task": task,
+                "seed": seed,
+                "randomization_request": "",
+                "start": "home",
+                "instruction": instruction,
+                "model": os.path.basename(str(self.config.actor_rollout_ref.model.get("path", "")).rstrip("/")),
+                "server": "verl",
+                "effort": self.apply_chat_template_kwargs.get("reasoning_effort"),
+                "history_k": self.history_k,
+                "object_state": False,
+                **dict(sim_config.get("episode_args") or {}),  # ABC: lift, lift_pick (the replay tool reads them)
+                "prepose": prepose_report,
+                "max_tokens": self.max_tokens,
+                "end_reason": end_reason,
+                "success": success,
+                "max_reward": reward,
+                "num_turns": len(records),
+                "wall_s": round(time.monotonic() - episode_start, 1),
+                "completion_tokens": completion_tokens,
+                # not in the drivers' episode.json: where the episode sits in the verl run
+                "sim": sim,
+                "rung": rung,
+                "prepose_request": prepose,
+                "max_turns": max_turns,
+                "split": info.get("split", "train"),
+                "global_steps": global_steps,
+                "plan_id": int(info.get("plan_id", -1)),
+                "calibration": bool(info.get("calibration", False)),
+                "uid": str(kwargs.get("uid", "")),
+                "session_id": session_id,
+                "frames": keep_frames,
+            }
+            self.artifacts.write(step_dir, name, episode, records, system, frames if keep_frames else None)
         reward_extra_info = {
             "acc": float(success),
             "rung": float(rung),
