@@ -7,6 +7,8 @@
 #
 # Episode records and sampled frames (off unless set): YAM_PEAR_ARTIFACTS_DIR=<run>/episodes,
 # YAM_PEAR_ARTIFACT_FRAMES=none|sample|all, YAM_PEAR_ARTIFACT_VAL_FRAMES=true|false. See the README.
+# YAM_PEAR_VIDEOS=1 also writes a couple of videos per step to <run>/episodes/videos while training runs
+# (YAM_PEAR_VIDEO_ARGS="--wandb-project <p> --wandb-run-id <id>" uploads them).
 #
 # Extra arguments are passed to hydra, e.g. data.custom_dataloader.holdout_rungs=7 trainer.total_training_steps=50
 set -xeuo pipefail
@@ -37,6 +39,13 @@ if [ "${VERL_USE_UV:-1}" != 0 ] && [ "${DEVICE:-gpu}" = gpu ]; then
 fi
 
 [ -f "${DATA_DIR}/val.parquet" ] || "${PYTHON[@]}" examples/yam_pear/create_dataset.py --local_save_dir "${DATA_DIR}" --streams "${STREAMS}"
+
+if [ "${YAM_PEAR_VIDEOS:-0}" != 0 ] && [ -n "${YAM_PEAR_ARTIFACTS_DIR:-}" ]; then
+    # shellcheck disable=SC2086
+    "${PYTHON[@]}" -m verl.experimental.yam_pear.videos "${YAM_PEAR_ARTIFACTS_DIR}" --watch 120 ${YAM_PEAR_VIDEO_ARGS:-} &
+    VIDEO_PID=$!
+    trap 'kill "${VIDEO_PID}" 2>/dev/null || true' EXIT
+fi
 
 "${PYTHON[@]}" -m verl.trainer.main_ppo \
     --config-path="${PWD}/examples/yam_pear/config" --config-name=yam_pear_grpo \

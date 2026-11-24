@@ -21,6 +21,7 @@ there on a branch of the verl fork. The recipe lives in the fork itself:
 | `verl/experimental/yam_pear/agent_loop.py` | `YamPearAgentLoop`, registered as `yam_pear_agent`. |
 | `verl/experimental/yam_pear/curriculum.py` | `LadderCurriculum`: the `estimate` / `plan` / `observe` controller and `RUNGS`. |
 | `verl/experimental/yam_pear/artifacts.py` | `EpisodeArtifacts`: per-episode `episode.json` / `turns.json` and sampled camera frames. |
+| `verl/experimental/yam_pear/videos.py` | A couple of videos per step from the sampled frames, optionally uploaded to wandb. |
 | `verl/experimental/yam_pear/dataloader.py` | Episode rows, the outcome log, `CurriculumDataLoader` (`data.custom_dataloader`). |
 | `verl/experimental/yam_pear/prompts/` | `station_system_prompt.md`, `raiden_environment.md`, `abc_environment.md` (copied unchanged), `fake_environment.md`. |
 | `verl/experimental/yam_pear/config/` | Agent loop configs: `agent_loop.yaml` (raiden + ABC), `agent_loop_fake.yaml`. |
@@ -216,6 +217,31 @@ step directories are numbered by verl's global step, which starts at 1 (the old 
 have saved frames to show next to a replay. The tools themselves were not run against these records (their
 paths are hard-wired to the node); the tests check the field names, and that replaying the recorded actions
 from `episode.json` reproduces the recorded outcome in the fake simulator.
+
+## Videos per step
+
+`videos.py` turns the sampled frames into a couple of videos per task per step: the median-reward episode
+(what the policy typically does) and the best one. Each video shows what the model saw, one picture per
+turn with the three cameras side by side and the turn, reward and outcome underneath. It is a slideshow of
+observations; continuous motion still needs `replay_video.py`.
+
+```bash
+YAM_PEAR_ARTIFACTS_DIR=<run>/episodes YAM_PEAR_VIDEOS=1 \
+YAM_PEAR_VIDEO_ARGS="--wandb-project yam_pear --wandb-run-id <trainer run id>" \   # optional upload
+bash examples/yam_pear/run_qwen3_8_27b_pear_fsdp.sh
+# or by hand, during or after a run:
+python -m verl.experimental.yam_pear.videos <run>/episodes [--watch 120] [--per-task 1] [--wandb-project ...]
+```
+
+```text
+<dir>/videos/step_<NNN>/<task>_r<rung>_<median|best>_<success|fail>.mp4
+<dir>/videos/step_<NNN>/index.json      seed, rung, reward, end reason of each video
+```
+
+A step is rendered once the next step has started (`--include-last`, or a run without `--watch`, also
+renders the newest one). On wandb the videos are logged as `videos/<train|eval>/<task>/<median|best>`
+against their own axis `videos/global_step`, so they can be attached to the trainer's run. Encoding needs
+`ffmpeg` on PATH or `pip install imageio-ffmpeg`. The wandb upload itself has not been run.
 
 ## Tests
 
