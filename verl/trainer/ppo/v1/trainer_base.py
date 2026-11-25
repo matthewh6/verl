@@ -545,6 +545,9 @@ class PPOTrainer(ABC):
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
             if rollout_data_dir:
                 self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
+            rollout_archive_dir = self.config.trainer.get("rollout_archive_dir", None)
+            if rollout_archive_dir:
+                self._archive_rollout_tensors(batch, rollout_archive_dir)
 
             # 7. cleanup transfer queue
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
@@ -1405,6 +1408,33 @@ class PPOTrainer(ABC):
         shutdown_workers = getattr(iterator, "_shutdown_workers", None)
         if shutdown_workers is not None:
             shutdown_workers()
+
+    def _archive_rollout_tensors(self, batch: KVBatchMeta, archive_dir: str):
+        """Save the exact token-level training batch of this step (for offline / SFT replay).
+
+        One file per step, `step_{global_steps:06d}.pt`, holding per-sample lists of 1-D tensors:
+        prompt ids, response ids, token rewards, the sampler's log-probs, the actor's pre-update
+        log-probs and the advantages used for the update, plus keys and padding flags.
+        """
+        os.makedirs(archive_dir, exist_ok=True)
+        fields = ["prompts", "responses", "rm_scores", "rollout_log_probs", "old_log_probs", "advantages"]
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        out = {
+            "global_steps": self.global_steps,
+            "keys": list(batch.keys),
+            "is_padding": [bool(tag.get("is_padding", False)) for tag in batch.tags],
+        }
+        for field in fields:
+            if field not in data.keys():
+                continue
+            value = data[field]
+            if getattr(value, "is_nested", False):
+                out[field] = [row.detach().cpu().clone() for row in value.unbind(0)]
+            else:
+                out[field] = value.detach().cpu().clone()
+        path = os.path.join(archive_dir, f"step_{self.global_steps:06d}.pt")
+        torch.save(out, path + ".tmp")
+        os.replace(path + ".tmp", path)
 
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
