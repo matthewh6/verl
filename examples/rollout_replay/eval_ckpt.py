@@ -26,7 +26,10 @@ def main():
     llm = LLM(model=a.ckpt, max_model_len=1424, seed=a.seed, dtype="bfloat16", **kv)
     tok = llm.get_tokenizer()
     prompts = [tok.apply_chat_template([dict(m) for m in r], tokenize=False, add_generation_prompt=True, enable_thinking=False) for r in df["prompt"]]
-    outs = llm.generate(prompts, SamplingParams(n=a.n, temperature=1.0, top_p=1.0, max_tokens=400, seed=a.seed))
+    # stop on both end tokens, as the online run's rollout engine does: a saved online checkpoint's config names only
+    # <|im_end|>, and a policy that learned to end with <|endoftext|> would otherwise run on to the length limit
+    stops = [i for i in tok.convert_tokens_to_ids(["<|im_end|>", "<|endoftext|>"]) if i is not None and i >= 0]
+    outs = llm.generate(prompts, SamplingParams(n=a.n, temperature=1.0, top_p=1.0, max_tokens=400, seed=a.seed, stop_token_ids=stops))
     rows = []
     for (_, r), o in zip(df.iterrows(), outs):
         ei = dict(r["extra_info"]); gt = r["reward_model"]["ground_truth"]
